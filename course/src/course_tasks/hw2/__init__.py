@@ -108,3 +108,21 @@ register_mjlab_task(
 # import time like the rest of the file, so a mistake here (a typo, a duplicate
 # id) will break `uv run list-envs` for every task — run it right after you
 # write it.
+
+import math
+
+ppo_t24_cfg = ppo_double_cfg()
+ppo_t24_cfg.num_steps_per_env = 24
+ppo_t24_cfg.max_iterations = math.ceil(
+    _DOUBLE_ITERATIONS * STEPS_PER_EPISODE / 24
+)
+ppo_t24_cfg.experiment_name = "hw2_ppo"
+ppo_t24_cfg.run_name = "T24"
+
+register_mjlab_task(
+    task_id="Course-HW2-DoubleCartpole-Balance-PPO-T24",
+    env_cfg=cartpole_double_balance_env_cfg(),
+    play_env_cfg=cartpole_double_balance_env_cfg(play=True),
+    rl_cfg=ppo_t24_cfg,
+    runner_cls=ReinforceRunner,
+)

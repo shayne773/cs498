@@ -50,7 +50,26 @@ def track_linear_velocity(env, command_name: str, asset_cfg: SceneEntityCfg = _R
     #    where sigma = relative_std * speed, clamped to [std_at_rest, std].
     # 4. progress = 1 - |planar error| / max(speed, std_at_rest), clamped to [0, 1].
     # 5. Return (1 - progress_weight) * tracking + progress_weight * progress, shape [B].
-    raise NotImplementedError("TODO: implement track_linear_velocity")
+
+    unit_v = torch.where((speed == 0).unsqueeze(1),
+                         command.new_tensor([1.0, 0.0]) ,
+                         command[:, :2] / speed.unsqueeze(1).clamp(min=1e-8))
+
+    unit_v_rotated = torch.stack([-unit_v[:,1], unit_v[:, 0]], dim=1)
+    planar_err = velocity[:, :2] - command[:, :2]
+    long = torch.sum(planar_err*unit_v, dim=1)
+    trans = torch.sum(planar_err*unit_v_rotated, dim=1)
+
+    sigma = (relative_std * speed).clamp(std_at_rest, std)
+    tracking = torch.exp(-(long/sigma)**2 - (trans/lateral_std)**2 - (velocity[:, 2]/vertical_std)**2)
+
+    progress = (1 - torch.linalg.vector_norm(planar_err, dim=1) / torch.max(speed, speed.new_tensor(std_at_rest))).clamp(0, 1)
+
+    return (1 - progress_weight) * tracking + progress_weight * progress
+
+
+
+
 
 
 def track_angular_velocity(env, command_name: str, asset_cfg: SceneEntityCfg = _ROBOT,
@@ -65,7 +84,7 @@ def track_angular_velocity(env, command_name: str, asset_cfg: SceneEntityCfg = _
     # TODO(student): return exp(-(measured yaw rate - commanded yaw rate)^2 / variance).
     # Perfect tracking gives 1, large errors approach 0. Only index 2 of each
     # tensor matters; changing roll or pitch rate must not change the result.
-    raise NotImplementedError("TODO: implement track_angular_velocity")
+    return torch.exp(-(angular_velocity[:, 2] - command[:, 2])**2 / variance)
 
 
 def upright(env, asset_cfg: SceneEntityCfg = _ROBOT):
@@ -79,7 +98,8 @@ def upright(env, asset_cfg: SceneEntityCfg = _ROBOT):
     # TODO(student): alignment = -gravity[:, 2] (so upright gives +1). Clamp it to
     # [0, 1] FIRST, then square. Upright scores 1; horizontal and inverted both
     # score 0. Squaring before clamping would give an inverted robot a score of 1.
-    raise NotImplementedError("TODO: implement upright")
+    alignment = (-gravity[:, 2]).clamp(0, 1)**2
+    return alignment
 
 
 def action_smoothness(env, acceleration_weight: float = 0.1):
@@ -96,7 +116,8 @@ def action_smoothness(env, acceleration_weight: float = 0.1):
     #   + acceleration_weight * sum over joints of (a_t - 2 a_{t-1} + a_{t-2})^2.
     # Return shape [B], nonnegative. A constant action costs 0. An action that
     # changes by the same step every tick has rate cost but zero acceleration cost.
-    raise NotImplementedError("TODO: implement action_smoothness")
+    penalty = torch.sum((action - prev_action)**2 + acceleration_weight * (action - 2 * prev_action + prev_prev_action)**2, dim = 1)
+    return penalty
 
 
 def standing_pose(env, command_name: str, asset_cfg: SceneEntityCfg = _ROBOT,
@@ -119,8 +140,13 @@ def standing_pose(env, command_name: str, asset_cfg: SceneEntityCfg = _ROBOT,
     # Return cost * gate, shape [B]. The gate is 1 for a zero command and falls
     # to 0 once EITHER the linear or the yaw command reaches its own threshold.
     # Normalize linear (m/s) and yaw (rad/s) separately; never add them together.
-    raise NotImplementedError("TODO: implement standing_pose")
-
+    
+    cost = (torch.mean((joint_pos - default_pos)**2, dim=1)
+            + velocity_weight * torch.mean(joint_vel**2, dim=1))
+    
+    gate = 1 - torch.max(torch.linalg.vector_norm(command[:, :2], dim=1) / linear_threshold,
+                         torch.abs(command[:, 2]) / yaw_threshold).clamp(0, 1)
+    return cost * gate
 
 def air_time(env, sensor_name: str, command_name: str, threshold_min: float = 0.05,
              threshold_max: float = 0.5, linear_threshold: float = 0.2,
@@ -140,8 +166,26 @@ def air_time(env, sensor_name: str, command_name: str, threshold_min: float = 0.
     # Sum over feet, so the result lies in [0, number of feet]. Then multiply by a
     # moving mask: 1 if |command_xy| > linear_threshold OR |command_yaw| > yaw_threshold
     # (strict), else 0. Return shape [B].
-    raise NotImplementedError("TODO: implement air_time")
+    
+    midpoint = (threshold_min + threshold_max) / 2
+    half_width = (threshold_max - threshold_min) / 2
 
+    score = (1 - torch.abs(airborne_time - midpoint) / half_width).clamp(0, 1)
+
+    score = torch.where(found > 0, 0.0, score)
+
+    air_reward = torch.sum(score, dim=1)
+    linear_speed = torch.linalg.vector_norm(command[:, :2], dim=1)
+    yaw_speed = torch.abs(command[:, 2])
+
+    moving = (
+        (linear_speed > linear_threshold)
+        | (yaw_speed > yaw_threshold)
+    ).float()
+
+    return air_reward * moving
+
+    
 
 def foot_slip(env, sensor_name: str, asset_cfg: SceneEntityCfg = _ROBOT):
     """Positive penalty for feet sliding while on the ground (weighted negatively).
@@ -154,4 +198,8 @@ def foot_slip(env, sensor_name: str, asset_cfg: SceneEntityCfg = _ROBOT):
     # TODO(student): for each grounded foot take the squared horizontal speed
     # (x and y components only; vertical motion must not count). Airborne feet
     # contribute 0. Sum over feet and return shape [B], nonnegative.
-    raise NotImplementedError("TODO: implement foot_slip")
+    
+    horizontal_speed = torch.linalg.vector_norm( foot_velocity[:, :, :2], dim=-1)
+    penalty = horizontal_speed**2
+    penalty = penalty * (found > 0).float()
+    return torch.sum(penalty, dim=1)

@@ -102,9 +102,11 @@ class PPO:
     "value of what comes after" to bootstrap. It is in the signature because an
     algorithm whose rollouts can stop mid-episode does need it.
     """
-    del last_obs
+
     st = self.storage
-    running = torch.zeros(st.num_envs, device=st.returns.device)
+    with torch.no_grad():
+      running = self.critic(last_obs)
+      self.last_value = running
     for t in reversed(range(st.num_transitions_per_env)):
       # (1 - done) stops a return leaking backwards across an episode boundary.
       running = st.rewards[t] + self.gamma * (1.0 - st.dones[t]) * running
@@ -113,46 +115,146 @@ class PPO:
   def compute_advantages(self) -> None:
     """`storage.advantages` from returns, minus the baseline, optionally normalized."""
     st = self.storage
-    if self.baseline == "value":
-      advantages = st.returns - st.values
-    else:
-      advantages = st.returns.clone()
+    T = st.num_transitions_per_env
+    advantages = torch.zeros_like(st.rewards)
+
+    for t in reversed(range(T)):
+      next_value = self.last_value
+      next_advantage = 0
+      if t != T-1:
+        next_value = st.values[t+1]
+        next_advantage = advantages[t+1]
+
+      advantages[t] =  ((st.rewards[t] + (self.gamma)* (1 - st.dones[t]) * next_value - st.values[t]) +
+                       (self.gamma*self.lam)*(1 - st.dones[t])*next_advantage)
+  
+
     if self.normalize_advantage:
       advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
     st.advantages = advantages
 
   def update(self) -> dict[str, float]:
-    """One full-batch gradient step. Returns losses for logging."""
-    obs, actions, _old_log_probs, returns, advantages = self.storage.flatten()
+      obs, actions, old_log_probs, returns, advantages = self.storage.flatten()
 
-    # Re-score the stored actions under the CURRENT policy: this is the copy of
-    # log pi that carries gradients. The stored `old_log_probs` came out of
-    # inference_mode and cannot be backpropagated through.
-    log_probs, entropy = self.actor.evaluate_actions(obs, actions)
+      batch_size = obs.shape[0]
 
-    policy_loss = -(log_probs * advantages).mean()
-    entropy_loss = -entropy.mean()
-    if self.baseline == "value":
-      value_loss = F.mse_loss(self.critic(obs), returns)
-    else:
-      value_loss = torch.zeros((), device=obs.device)
+      policy_loss_sum = 0.0
+      value_loss_sum = 0.0
+      entropy_sum = 0.0
+      ratio_drift_sum = 0.0
+      clip_fraction_sum = 0.0
+      num_updates = 0
 
-    loss = (
-      policy_loss
-      + self.value_loss_coef * value_loss
-      + self.entropy_coef * entropy_loss
-    )
+      for _ in range(self.num_learning_epochs):
 
-    self.optimizer.zero_grad()
-    loss.backward()
-    nn.utils.clip_grad_norm_(self.params, self.max_grad_norm)
-    self.optimizer.step()
+          # Shuffle the rollout samples for this epoch.
+          indices = torch.randperm(batch_size, device=obs.device)
 
-    return {
-      "policy": policy_loss.item(),
-      "value": value_loss.item(),
-      "entropy": entropy.mean().item(),
-    }
+          # Split into minibatches.
+          minibatches = torch.chunk(
+              indices,
+              self.num_mini_batches,
+          )
+
+          for idx in minibatches:
+              obs_mb = obs[idx]
+              actions_mb = actions[idx]
+              old_log_probs_mb = old_log_probs[idx]
+              returns_mb = returns[idx]
+              advantages_mb = advantages[idx]
+
+              # Re-score old actions under CURRENT policy.
+              log_probs, entropy = self.actor.evaluate_actions(
+                  obs_mb,
+                  actions_mb,
+              )
+
+              # PPO ratio
+              ratio = torch.exp(
+                  log_probs - old_log_probs_mb
+              )
+
+              # Unclipped objective
+              unclipped = ratio * advantages_mb
+
+              # Clipped objective
+              clipped = (
+                  torch.clamp(
+                      ratio,
+                      1.0 - self.clip_param,
+                      1.0 + self.clip_param,
+                  )
+                  * advantages_mb
+              )
+
+              policy_loss = -torch.minimum(
+                  unclipped,
+                  clipped,
+              ).mean()
+
+              entropy_loss = -entropy.mean()
+
+              if self.baseline == "value":
+                  value_loss = F.mse_loss(
+                      self.critic(obs_mb),
+                      returns_mb,
+                  )
+              else:
+                  value_loss = torch.zeros(
+                      (),
+                      device=obs.device,
+                  )
+
+              loss = (
+                  policy_loss
+                  + self.value_loss_coef * value_loss
+                  + self.entropy_coef * entropy_loss
+              )
+
+              self.optimizer.zero_grad()
+              loss.backward()
+
+              nn.utils.clip_grad_norm_(
+                  self.params,
+                  self.max_grad_norm,
+              )
+
+              self.optimizer.step()
+
+              # Diagnostics
+              with torch.no_grad():
+                  ratio_drift = (
+                      ratio - 1.0
+                  ).abs().mean()
+
+                  clip_fraction = (
+                      (ratio < 1.0 - self.clip_param)
+                      | (ratio > 1.0 + self.clip_param)
+                  ).float().mean()
+
+              policy_loss_sum += policy_loss.item()
+              value_loss_sum += value_loss.item()
+              entropy_sum += entropy.mean().item()
+              ratio_drift_sum += ratio_drift.item()
+              clip_fraction_sum += clip_fraction.item()
+
+              num_updates += 1
+
+      return {
+          "policy": policy_loss_sum / num_updates,
+          "value": value_loss_sum / num_updates,
+          "entropy": entropy_sum / num_updates,
+          "ratio_drift": ratio_drift_sum / num_updates,
+          "clip_fraction": clip_fraction_sum / num_updates,
+      }
+
+
+
+    
+
+
+
+
 
   # -- Plumbing. ------------------------------------------------------------
 
